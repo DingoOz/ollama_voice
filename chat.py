@@ -931,7 +931,30 @@ def run_repl(
         speaker.shutdown()
 
 
+VENV_PYTHON = "/home/dingo/Programming/Piper/oww-env/bin/python"
+
+
+def _reexec_in_venv_if_needed() -> None:
+    """The system Python on this Jetson has a numpy/pandas ABI mismatch
+    that breaks openwakeword and tflite_runtime. Re-exec under the
+    oww-env venv so `python3 chat.py` and `./chat.py` both work."""
+    if os.environ.get("OLLAMA_VOICE_VENV_REEXEC"):
+        return
+    if not os.path.exists(VENV_PYTHON):
+        return
+    # Don't use realpath — the venv python is a symlink to the system
+    # python on this Jetson, so realpath collapses them. Compare by the
+    # interpreter's reported sys.executable (which is the venv path when
+    # invoked via the venv).
+    if sys.executable == VENV_PYTHON:
+        return
+    os.environ["OLLAMA_VOICE_VENV_REEXEC"] = "1"
+    print(f"[switching to venv: {VENV_PYTHON}]", flush=True)
+    os.execv(VENV_PYTHON, [VENV_PYTHON, os.path.abspath(__file__), *sys.argv[1:]])
+
+
 if __name__ == "__main__":
+    _reexec_in_venv_if_needed()
     parser = argparse.ArgumentParser(description="Type-to-voice chat with Ollama + Piper TTS.")
     parser.add_argument(
         "--volume", default="1.0",
