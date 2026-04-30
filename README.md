@@ -60,6 +60,10 @@ keeps its prior level. `:vol 0` mutes synthesis without breaking the chat.
 - `AUDIO_DEVICE` — ALSA device string; `plughw:1,0` is the USB speaker
 - `SYSTEM_PROMPT` — nudges the model toward concise, spoken-friendly replies
 
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).
+
 ## Notes
 
 - **GPU memory is tight.** `gemma4:e2b` is ~7 GB on an 8 GB Jetson. If you
