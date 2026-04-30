@@ -1,8 +1,10 @@
 # ollama_voice
 
-Type-to-voice chat for the Jetson Orin Nano. Prompts go to a local Ollama
+Voice (or text) chat for the Jetson Orin Nano. Prompts go to a local Ollama
 model (`gemma4:e2b`); responses stream to the terminal **and** speak through
-the USB speaker via Piper TTS.
+the USB speaker via Piper TTS. Press Enter at an empty prompt to **speak**
+your message — it's captured from the C920 webcam mic and transcribed with
+Whisper.
 
 Sentences are synthesized as they arrive from the LLM, so audio starts
 playing before generation finishes.
@@ -23,7 +25,11 @@ These are already set up on this Jetson, but listed for reference:
 - **Voice model:** `en_US-amy-medium.onnx` (+ `.onnx.json`) under
   `~/Programming/Piper/voices/`
 - **USB speaker** as ALSA card 1 (`plughw:1,0` — confirm with `aplay -l`)
-- Python 3.10 with `requests`
+- **Whisper** (`openai-whisper` pip package) with the `tiny` model cached
+  under `~/.cache/whisper/` — for speech input
+- **C920 webcam mic** as ALSA card 0 (`plughw:0,0` — confirm with
+  `arecord -l`)
+- Python 3.10 with `requests`, `numpy`
 
 ## Run
 
@@ -38,16 +44,38 @@ python3 chat.py --volume 70      # 70%
 python3 chat.py --volume 1.5     # 150% (may clip)
 ```
 
+Other CLI flags:
+
+```bash
+python3 chat.py --no-mic                       # disable speech input
+python3 chat.py --mic-device plughw:0,0        # override mic ALSA device
+python3 chat.py --whisper-model base.en        # swap whisper model
+```
+
 ## REPL commands
 
-| Command       | Effect                                               |
-| ------------- | ---------------------------------------------------- |
-| `:q`          | Quit                                                 |
-| `:reset`      | Clear conversation history                           |
-| `:vol`        | Show current volume                                  |
-| `:vol N`      | Set volume. `N` is 0–200 percent, or 0.0–2.0 mult.   |
-| `Ctrl-C`      | Interrupt current speech (drops queue, stays in REPL)|
-| `Ctrl-D`      | Quit                                                 |
+| Command       | Effect                                                |
+| ------------- | ----------------------------------------------------- |
+| `<Enter>`     | (empty input) Push-to-talk: record from mic and send  |
+| `:say`        | Same as pressing Enter on an empty prompt             |
+| `:q`          | Quit                                                  |
+| `:reset`      | Clear conversation history                            |
+| `:vol`        | Show current volume                                   |
+| `:vol N`      | Set volume. `N` is 0–200 percent, or 0.0–2.0 mult.    |
+| `Ctrl-C`      | Interrupt current speech (drops queue, stays in REPL) |
+| `Ctrl-D`      | Quit                                                  |
+
+### Speech input
+
+Press Enter on an empty prompt to start recording. The status bar shows
+`calibrating mic` → `listening` → `recording` → `transcribing`, with a
+braille throbber. Recording stops automatically after ~1.5 s of silence
+(or 30 s hard cap). The transcript is echoed as `you (spoken)> ...` and
+sent to Ollama like a typed prompt.
+
+The Whisper model loads lazily on the first speech attempt (~73 MB for
+`tiny`, a few seconds on Jetson CPU), so users in text-only mode pay
+nothing.
 
 Volume changes apply to the **next** spoken sentence; anything already queued
 keeps its prior level. `:vol 0` mutes synthesis without breaking the chat.
@@ -58,6 +86,8 @@ keeps its prior level. `:vol 0` mutes synthesis without breaking the chat.
 - `VOICE` — point to another `.onnx` file; `en_US-hfc_female-medium.onnx`
   is also installed
 - `AUDIO_DEVICE` — ALSA device string; `plughw:1,0` is the USB speaker
+- `MIC_DEVICE` — ALSA capture device; `plughw:0,0` is the C920 mic
+- `WHISPER_MODEL` — `tiny`, `base.en`, etc. Bigger = slower but better
 - `SYSTEM_PROMPT` — nudges the model toward concise, spoken-friendly replies
 
 ## License
