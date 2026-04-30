@@ -744,7 +744,7 @@ def parse_volume(s: str) -> float:
 
 
 def run_repl(
-    initial_volume: float = 1.0,
+    initial_volume: float = 0.2,
     mic_enabled: bool = True,
     mic_device: str = MIC_DEVICE,
     whisper_model: str = WHISPER_MODEL,
@@ -957,8 +957,8 @@ if __name__ == "__main__":
     _reexec_in_venv_if_needed()
     parser = argparse.ArgumentParser(description="Type-to-voice chat with Ollama + Piper TTS.")
     parser.add_argument(
-        "--volume", default="1.0",
-        help="Initial speech volume. Accepts 0.0-2.0 multiplier or 0-200 percent (default: 1.0).",
+        "--volume", default="0.2",
+        help="Initial speech volume. Accepts 0.0-2.0 multiplier or 0-200 percent (default: 0.2 = 20%).",
     )
     parser.add_argument(
         "--no-mic", action="store_true",
