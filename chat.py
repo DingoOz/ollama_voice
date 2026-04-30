@@ -1,21 +1,29 @@
-#!/usr/bin/env python3
+#!/home/dingo/Programming/Piper/oww-env/bin/python
 """Type a prompt -> Ollama (gemma4:e2b) -> Piper TTS -> USB speaker.
 
 Streams the LLM response and speaks it sentence-by-sentence so audio starts
-playing before generation finishes.
+playing before generation finishes. Optional voice input via push-to-talk
+(empty Enter / ':say') and wake-word activation (--wake, default 'hey jarvis').
+
+Run from the oww-env venv so all native deps line up:
+    /home/dingo/Programming/Piper/oww-env/bin/python chat.py [...]
+The shebang above makes `./chat.py` work directly.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import re
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import requests
@@ -26,6 +34,8 @@ VOICE = Path("/home/dingo/Programming/Piper/voices/en_US-amy-medium.onnx")
 AUDIO_DEVICE = "plughw:1,0"   # USB speaker (card 1)
 MIC_DEVICE = "plughw:0,0"     # C920 webcam mic (card 0)
 WHISPER_MODEL = "tiny"        # tiny ~73MB, fast on Jetson CPU
+WAKE_MODEL_NAME = "hey_jarvis_v0.1"  # built-in openwakeword model
+WAKE_THRESHOLD = 0.5          # 0..1; raise for fewer false positives
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant. Your replies will be spoken aloud, "
     "so keep them concise and conversational. Avoid markdown, code fences, "
@@ -333,6 +343,233 @@ class Listener:
         return (result.get("text") or "").strip()
 
 
+class WakeListener:
+    """Continuous wake-word listener.
+
+    Owns a single arecord stream feeding a state machine that alternates
+    between WAKE_LISTENING (every 80 ms frame fed to openwakeword) and
+    CAPTURING (energy-VAD recording of the user's command after the wake
+    word is heard). The captured audio is transcribed via the supplied
+    Listener (so Whisper is loaded once and shared with push-to-talk).
+
+    Detected commands are pushed onto `commands` for the REPL to consume.
+    Detection is suppressed while the assistant is speaking, to avoid
+    self-triggering on the speaker's audio.
+    """
+
+    SAMPLE_RATE = 16000
+    FRAME_SAMPLES = 1280              # openwakeword's expected chunk
+    FRAME_BYTES = FRAME_SAMPLES * 2   # int16 mono
+    FRAME_MS = FRAME_SAMPLES * 1000 // SAMPLE_RATE    # 80 ms
+    SILENCE_HANG_FRAMES = 19          # ~1.5 s of silence ends utterance
+    SPEECH_TRIGGER_FRAMES = 2         # ~160 ms above threshold to count as speech-started
+    MAX_CAPTURE_FRAMES = 30 * 1000 // FRAME_MS        # 30 s hard cap
+    POST_DETECT_COOLDOWN_S = 1.5      # ignore predictions briefly after detection
+    MIN_RMS_THRESHOLD = 800.0         # floor for very quiet rooms
+
+    def __init__(
+        self,
+        listener: Listener,
+        speaker: "Speaker",
+        status: "StatusBar | None" = None,
+        mic_device: str = MIC_DEVICE,
+        wake_model: str = WAKE_MODEL_NAME,
+        threshold: float = WAKE_THRESHOLD,
+    ):
+        self.listener = listener
+        self.speaker = speaker
+        self.status = status
+        self.mic_device = mic_device
+        self.wake_model = wake_model
+        self.threshold = float(threshold)
+        self.commands: "queue.Queue[str]" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._oww = None
+        self._proc: subprocess.Popen | None = None
+
+    def _load_oww(self):
+        # Lazy and optional — keeps openwakeword off the import path until
+        # the user actually opts in with --wake.
+        if self._oww is not None:
+            return self._oww
+        if self.status:
+            self.status.set_activity(f"loading wake model {self.wake_model}")
+        else:
+            print(f"[loading wake model {self.wake_model}...]", flush=True)
+        from openwakeword.model import Model
+        self._oww = Model(
+            wakeword_models=[self.wake_model],
+            inference_framework="onnx",
+        )
+        if self.status:
+            self.status.set_activity(None)
+        return self._oww
+
+    def start(self) -> None:
+        # Load model + Whisper up-front so the first wake doesn't pause for
+        # a multi-second model load.
+        self._load_oww()
+        self.listener._ensure_model(self.status)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="wake-listener")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _read_frame(self) -> bytes | None:
+        assert self._proc is not None and self._proc.stdout is not None
+        buf = b""
+        while len(buf) < self.FRAME_BYTES:
+            if self._stop.is_set():
+                return None
+            chunk = self._proc.stdout.read(self.FRAME_BYTES - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    @staticmethod
+    def _rms(frame_bytes: bytes) -> float:
+        import numpy as np
+        s = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32)
+        if s.size == 0:
+            return 0.0
+        return float((s * s).mean() ** 0.5)
+
+    def _set_activity(self, label: str | None) -> None:
+        if self.status:
+            self.status.set_activity(label)
+
+    def _run(self) -> None:
+        import numpy as np
+        try:
+            self._proc = subprocess.Popen(
+                [
+                    "arecord",
+                    "-D", self.mic_device,
+                    "-r", str(self.SAMPLE_RATE),
+                    "-f", "S16_LE",
+                    "-c", "1",
+                    "-t", "raw",
+                    "-q",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError as e:
+            print(f"\n[wake mic error: {e}]")
+            return
+
+        self._set_activity("waiting for wake word")
+        cooldown_until = 0.0
+        try:
+            while not self._stop.is_set():
+                frame = self._read_frame()
+                if frame is None:
+                    break
+
+                # Suppress detection while we're speaking — the speaker
+                # bleeds into the mic and easily false-triggers.
+                if self.speaker.is_playing() or self.speaker.pending() > 0:
+                    # Reset OWW so post-playback predictions start clean.
+                    self._oww.reset()
+                    cooldown_until = time.monotonic() + 0.5
+                    continue
+
+                if time.monotonic() < cooldown_until:
+                    continue
+
+                samples = np.frombuffer(frame, dtype=np.int16)
+                scores = self._oww.predict(samples)
+                top = max(scores.values()) if scores else 0.0
+                if top < self.threshold:
+                    continue
+
+                # --- WAKE WORD DETECTED ---
+                self._set_activity(f"wake heard ({top:.2f})")
+                self._oww.reset()
+
+                # Capture the following utterance with a simple energy VAD
+                # right off the same stream. Use a brief rolling baseline
+                # to set a per-utterance threshold.
+                self._set_activity("listening")
+                captured: list[bytes] = []
+                noise_levels: list[float] = []
+                # Calibrate noise floor over ~240 ms.
+                for _ in range(3):
+                    f = self._read_frame()
+                    if f is None:
+                        break
+                    noise_levels.append(self._rms(f))
+                    captured.append(f)
+                if not noise_levels:
+                    break
+                noise_floor = sum(noise_levels) / len(noise_levels)
+                vad_threshold = max(noise_floor * 3.0, self.MIN_RMS_THRESHOLD)
+
+                self._set_activity("recording")
+                speech_started = False
+                consecutive_speech = 0
+                silent_streak = 0
+                for _ in range(self.MAX_CAPTURE_FRAMES):
+                    if self._stop.is_set():
+                        break
+                    f = self._read_frame()
+                    if f is None:
+                        break
+                    captured.append(f)
+                    level = self._rms(f)
+                    if level > vad_threshold:
+                        consecutive_speech += 1
+                        if consecutive_speech >= self.SPEECH_TRIGGER_FRAMES:
+                            speech_started = True
+                        silent_streak = 0
+                    else:
+                        consecutive_speech = 0
+                        if speech_started:
+                            silent_streak += 1
+                            if silent_streak >= self.SILENCE_HANG_FRAMES:
+                                break
+
+                if not speech_started:
+                    self._set_activity("waiting for wake word")
+                    cooldown_until = time.monotonic() + self.POST_DETECT_COOLDOWN_S
+                    continue
+
+                self._set_activity("transcribing")
+                raw = b"".join(captured)
+                samples_f = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                try:
+                    text = self.listener.transcribe(samples_f, status=None)
+                except Exception as e:  # noqa: BLE001
+                    text = ""
+                    print(f"\n[wake transcribe error: {e}]")
+
+                text = text.strip()
+                if text:
+                    self.commands.put(text)
+
+                self._set_activity("waiting for wake word")
+                cooldown_until = time.monotonic() + self.POST_DETECT_COOLDOWN_S
+        finally:
+            self._set_activity(None)
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+
+
 class StatusBar:
     """Pinned bottom-row status with a braille throbber.
 
@@ -507,16 +744,24 @@ def parse_volume(s: str) -> float:
 
 
 def run_repl(
-    initial_volume: float = 1.0,
+    initial_volume: float = 0.2,
     mic_enabled: bool = True,
     mic_device: str = MIC_DEVICE,
     whisper_model: str = WHISPER_MODEL,
+    wake_enabled: bool = False,
+    wake_model: str = WAKE_MODEL_NAME,
+    wake_threshold: float = WAKE_THRESHOLD,
 ) -> None:
     if not VOICE.exists():
         sys.exit(f"Voice model not found: {VOICE}")
     speaker = Speaker(VOICE, AUDIO_DEVICE, volume=initial_volume)
     status = StatusBar(speaker)
+    # Wake mode needs the listener for transcription, even if push-to-talk
+    # is logically a different feature.
+    if wake_enabled and not mic_enabled:
+        mic_enabled = True
     listener = Listener(mic_device=mic_device, model_name=whisper_model) if mic_enabled else None
+    wake: WakeListener | None = None
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def handle_sigint(signum, frame):
@@ -556,24 +801,67 @@ def run_repl(
             return None
         return text
 
-    mic_hint = " '<Enter>' speak," if mic_enabled else ""
-    print(
-        f"Voice chat with {MODEL}. Volume {int(speaker.volume * 100)}%. "
-        f"Commands:{mic_hint} ':q' quit, ':reset' clear history, ':vol N' volume (0-200)."
-    )
-    status.start()
-    try:
-        while True:
+    def read_user_turn() -> str | None:
+        """Return the next user turn (typed or wake-driven). None on EOF."""
+        if wake is None:
+            # Plain blocking input — original path, keeps readline editing.
             status.pause()
             try:
-                user = input("\nyou> ").strip()
+                return input("\nyou> ").strip()
             except EOFError:
-                print()
-                break
+                return None
             finally:
                 status.resume()
+        # Wake mode: poll stdin (line-buffered, no readline editing) AND the
+        # wake-listener queue. Whichever produces input first wins.
+        sys.stdout.write("\nyou> ")
+        sys.stdout.flush()
+        while True:
+            try:
+                spoken = wake.commands.get_nowait()
+                print(f"\nyou (wake)> {spoken}")
+                return spoken.strip()
+            except queue.Empty:
+                pass
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.15)
+            except (OSError, ValueError):
+                return None
+            if ready:
+                line = sys.stdin.readline()
+                if line == "":
+                    return None  # EOF
+                return line.strip()
+
+    mic_hint = " '<Enter>' speak," if (mic_enabled and not wake_enabled) else ""
+    wake_hint = f" (say '{wake_model.split('_')[0]} {wake_model.split('_')[1]}')" if wake_enabled else ""
+    print(
+        f"Voice chat with {MODEL}. Volume {int(speaker.volume * 100)}%."
+        f"{wake_hint} Commands:{mic_hint} ':q' quit, ':reset' clear history, ':vol N' volume (0-200)."
+    )
+    status.start()
+    if wake_enabled:
+        try:
+            wake = WakeListener(
+                listener=listener, speaker=speaker, status=status,
+                mic_device=mic_device, wake_model=wake_model, threshold=wake_threshold,
+            )
+            wake.start()
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[wake disabled: {e}]")
+            wake = None
+    try:
+        while True:
+            user = read_user_turn()
+            if user is None:
+                print()
+                break
             if not user:
                 if not mic_enabled:
+                    continue
+                if wake is not None:
+                    # In wake mode, blank line is a no-op (use the wake word
+                    # or :say to record on demand).
                     continue
                 # Push-to-talk: empty Enter starts a recording.
                 spoken = capture_voice()
@@ -637,15 +925,40 @@ def run_repl(
             history.append({"role": "assistant", "content": full_reply})
             speaker.wait_until_idle()
     finally:
+        if wake is not None:
+            wake.stop()
         status.stop()
         speaker.shutdown()
 
 
+VENV_PYTHON = "/home/dingo/Programming/Piper/oww-env/bin/python"
+
+
+def _reexec_in_venv_if_needed() -> None:
+    """The system Python on this Jetson has a numpy/pandas ABI mismatch
+    that breaks openwakeword and tflite_runtime. Re-exec under the
+    oww-env venv so `python3 chat.py` and `./chat.py` both work."""
+    if os.environ.get("OLLAMA_VOICE_VENV_REEXEC"):
+        return
+    if not os.path.exists(VENV_PYTHON):
+        return
+    # Don't use realpath — the venv python is a symlink to the system
+    # python on this Jetson, so realpath collapses them. Compare by the
+    # interpreter's reported sys.executable (which is the venv path when
+    # invoked via the venv).
+    if sys.executable == VENV_PYTHON:
+        return
+    os.environ["OLLAMA_VOICE_VENV_REEXEC"] = "1"
+    print(f"[switching to venv: {VENV_PYTHON}]", flush=True)
+    os.execv(VENV_PYTHON, [VENV_PYTHON, os.path.abspath(__file__), *sys.argv[1:]])
+
+
 if __name__ == "__main__":
+    _reexec_in_venv_if_needed()
     parser = argparse.ArgumentParser(description="Type-to-voice chat with Ollama + Piper TTS.")
     parser.add_argument(
-        "--volume", default="1.0",
-        help="Initial speech volume. Accepts 0.0-2.0 multiplier or 0-200 percent (default: 1.0).",
+        "--volume", default="0.2",
+        help="Initial speech volume. Accepts 0.0-2.0 multiplier or 0-200 percent (default: 0.2 = 20%).",
     )
     parser.add_argument(
         "--no-mic", action="store_true",
@@ -659,6 +972,18 @@ if __name__ == "__main__":
         "--whisper-model", default=WHISPER_MODEL,
         help=f"Whisper model name for transcription (default: {WHISPER_MODEL}).",
     )
+    parser.add_argument(
+        "--wake", action="store_true",
+        help="Enable wake-word activation (default: off). Implies --mic.",
+    )
+    parser.add_argument(
+        "--wake-model", default=WAKE_MODEL_NAME,
+        help=f"openwakeword model to listen for (default: {WAKE_MODEL_NAME}).",
+    )
+    parser.add_argument(
+        "--wake-threshold", type=float, default=WAKE_THRESHOLD,
+        help=f"Detection score 0..1 (default: {WAKE_THRESHOLD}). Raise for fewer false positives.",
+    )
     args = parser.parse_args()
     try:
         vol = parse_volume(args.volume)
@@ -669,4 +994,7 @@ if __name__ == "__main__":
         mic_enabled=not args.no_mic,
         mic_device=args.mic_device,
         whisper_model=args.whisper_model,
+        wake_enabled=args.wake,
+        wake_model=args.wake_model,
+        wake_threshold=args.wake_threshold,
     )
