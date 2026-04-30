@@ -23,7 +23,9 @@ import requests
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "gemma4:e2b"
 VOICE = Path("/home/dingo/Programming/Piper/voices/en_US-amy-medium.onnx")
-AUDIO_DEVICE = "plughw:1,0"  # USB speaker (card 1)
+AUDIO_DEVICE = "plughw:1,0"   # USB speaker (card 1)
+MIC_DEVICE = "plughw:0,0"     # C920 webcam mic (card 0)
+WHISPER_MODEL = "tiny"        # tiny ~73MB, fast on Jetson CPU
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant. Your replies will be spoken aloud, "
     "so keep them concise and conversational. Avoid markdown, code fences, "
@@ -165,6 +167,172 @@ class Speaker:
                 self._current = None
 
 
+class Listener:
+    """Capture from a mic with simple energy VAD, then transcribe with Whisper.
+
+    Whisper model loads lazily on first use (~73MB for 'tiny', a few seconds
+    on Jetson CPU) so users who never invoke voice input pay no cost.
+    """
+
+    SAMPLE_RATE = 16000
+    FRAME_MS = 30
+    FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000          # 480
+    FRAME_BYTES = FRAME_SAMPLES * 2                          # int16 mono
+    CALIBRATE_FRAMES = 10                                    # ~300 ms
+    SPEECH_TRIGGER_FRAMES = 3                                # ~90 ms above threshold to start
+    SILENCE_HANG_FRAMES = 50                                 # ~1.5 s of silence ends utterance
+    PREROLL_FRAMES = 6                                       # keep ~180 ms before trigger
+    MIN_RMS_THRESHOLD = 800.0                                # floor for very quiet rooms
+    MAX_RECORD_SECONDS = 30
+    PRE_TRIGGER_TIMEOUT_S = 8                                # give up if no speech detected
+
+    def __init__(self, mic_device: str = MIC_DEVICE, model_name: str = WHISPER_MODEL):
+        self.mic_device = mic_device
+        self.model_name = model_name
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self, status: "StatusBar | None" = None):
+        if self._model is not None:
+            return self._model
+        with self._lock:
+            if self._model is None:
+                if status:
+                    status.set_activity(f"loading whisper {self.model_name}")
+                else:
+                    print(f"[loading whisper {self.model_name}...]", flush=True)
+                import whisper  # lazy: ~1s import + torch
+                self._model = whisper.load_model(self.model_name)
+                if status:
+                    status.set_activity(None)
+        return self._model
+
+    def record_until_silence(self, status: "StatusBar | None" = None):
+        """Block until an utterance is captured. Returns float32 numpy array
+        at 16 kHz, or None if cancelled / nothing captured."""
+        import numpy as np
+        proc = subprocess.Popen(
+            [
+                "arecord",
+                "-D", self.mic_device,
+                "-r", str(self.SAMPLE_RATE),
+                "-f", "S16_LE",
+                "-c", "1",
+                "-t", "raw",
+                "-q",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        def read_frame() -> bytes | None:
+            assert proc.stdout is not None
+            buf = b""
+            while len(buf) < self.FRAME_BYTES:
+                chunk = proc.stdout.read(self.FRAME_BYTES - len(buf))
+                if not chunk:
+                    return None
+                buf += chunk
+            return buf
+
+        def rms(frame_bytes: bytes) -> float:
+            samples = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float32)
+            if samples.size == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(samples * samples)))
+
+        captured: list[bytes] = []
+        try:
+            # Calibrate noise floor.
+            if status:
+                status.set_activity("calibrating mic")
+            noise_levels = []
+            for _ in range(self.CALIBRATE_FRAMES):
+                f = read_frame()
+                if f is None:
+                    return None
+                noise_levels.append(rms(f))
+            noise_floor = sum(noise_levels) / len(noise_levels)
+            threshold = max(noise_floor * 3.0, self.MIN_RMS_THRESHOLD)
+
+            # Wait for speech, keeping a small pre-roll buffer.
+            if status:
+                status.set_activity("listening")
+            preroll: list[bytes] = []
+            consecutive_speech = 0
+            max_pre_frames = int(self.PRE_TRIGGER_TIMEOUT_S * 1000 / self.FRAME_MS)
+            triggered = False
+            for _ in range(max_pre_frames):
+                f = read_frame()
+                if f is None:
+                    return None
+                preroll.append(f)
+                if len(preroll) > self.PREROLL_FRAMES:
+                    preroll.pop(0)
+                if rms(f) > threshold:
+                    consecutive_speech += 1
+                    if consecutive_speech >= self.SPEECH_TRIGGER_FRAMES:
+                        triggered = True
+                        break
+                else:
+                    consecutive_speech = 0
+
+            if not triggered:
+                return None
+
+            captured.extend(preroll)
+
+            # Record until silence_hang frames are below threshold.
+            if status:
+                status.set_activity("recording")
+            silent_run = 0
+            max_frames = int(self.MAX_RECORD_SECONDS * 1000 / self.FRAME_MS)
+            for _ in range(max_frames):
+                f = read_frame()
+                if f is None:
+                    break
+                captured.append(f)
+                if rms(f) > threshold:
+                    silent_run = 0
+                else:
+                    silent_run += 1
+                    if silent_run >= self.SILENCE_HANG_FRAMES:
+                        break
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if status:
+                status.set_activity(None)
+
+        if not captured:
+            return None
+        raw = b"".join(captured)
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        return samples
+
+    def transcribe(self, samples, status: "StatusBar | None" = None) -> str:
+        if samples is None or len(samples) == 0:
+            return ""
+        self._ensure_model(status)
+        if status:
+            status.set_activity("transcribing")
+        try:
+            result = self._model.transcribe(
+                samples,
+                language="en",
+                fp16=False,           # CPU
+                condition_on_previous_text=False,
+            )
+        finally:
+            if status:
+                status.set_activity(None)
+        return (result.get("text") or "").strip()
+
+
 class StatusBar:
     """Pinned bottom-row status with a braille throbber.
 
@@ -188,6 +356,7 @@ class StatusBar:
         self._write_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._last_painted: tuple[str, bool] | None = None
+        self._activity: str | None = None
 
     def start(self) -> None:
         if not self.enabled:
@@ -226,6 +395,10 @@ class StatusBar:
         else:
             self._thinking.clear()
 
+    def set_activity(self, label: str | None) -> None:
+        """Override the auto-derived label (e.g. 'listening', 'recording')."""
+        self._activity = label
+
     def pause(self) -> None:
         """Stop repainting and clear the bar so input() owns the terminal."""
         if not self.enabled:
@@ -243,6 +416,8 @@ class StatusBar:
 
     def _state_label(self) -> tuple[str, bool]:
         """Return (label, animated)."""
+        if self._activity is not None:
+            return self._activity, True
         playing = self.speaker.is_playing()
         pending = self.speaker.pending()
         thinking = self._thinking.is_set()
@@ -331,24 +506,60 @@ def parse_volume(s: str) -> float:
     return v
 
 
-def run_repl(initial_volume: float = 1.0) -> None:
+def run_repl(
+    initial_volume: float = 1.0,
+    mic_enabled: bool = True,
+    mic_device: str = MIC_DEVICE,
+    whisper_model: str = WHISPER_MODEL,
+) -> None:
     if not VOICE.exists():
         sys.exit(f"Voice model not found: {VOICE}")
     speaker = Speaker(VOICE, AUDIO_DEVICE, volume=initial_volume)
     status = StatusBar(speaker)
+    listener = Listener(mic_device=mic_device, model_name=whisper_model) if mic_enabled else None
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def handle_sigint(signum, frame):
         # Ctrl-C interrupts speech without exiting the program.
         speaker.interrupt()
         status.thinking(False)
+        status.set_activity(None)
         print("\n[interrupted]")
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    def capture_voice() -> str | None:
+        """Record from mic, transcribe, return text (or None if nothing heard)."""
+        if listener is None:
+            print("[voice input disabled — start with --mic to enable]")
+            return None
+        try:
+            samples = listener.record_until_silence(status=status)
+        except FileNotFoundError as e:
+            print(f"\n[mic error: {e}]")
+            return None
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[mic error: {e}]")
+            status.set_activity(None)
+            return None
+        if samples is None:
+            print("[no speech detected]")
+            return None
+        try:
+            text = listener.transcribe(samples, status=status)
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[transcribe error: {e}]")
+            status.set_activity(None)
+            return None
+        if not text:
+            print("[transcription was empty]")
+            return None
+        return text
+
+    mic_hint = " '<Enter>' speak," if mic_enabled else ""
     print(
         f"Voice chat with {MODEL}. Volume {int(speaker.volume * 100)}%. "
-        "Commands: ':q' quit, ':reset' clear history, ':vol N' set volume (0-200)."
+        f"Commands:{mic_hint} ':q' quit, ':reset' clear history, ':vol N' volume (0-200)."
     )
     status.start()
     try:
@@ -362,9 +573,22 @@ def run_repl(initial_volume: float = 1.0) -> None:
             finally:
                 status.resume()
             if not user:
-                continue
+                if not mic_enabled:
+                    continue
+                # Push-to-talk: empty Enter starts a recording.
+                spoken = capture_voice()
+                if not spoken:
+                    continue
+                user = spoken
+                print(f"you (spoken)> {user}")
             if user in (":q", ":quit", ":exit"):
                 break
+            if user == ":say":
+                spoken = capture_voice()
+                if not spoken:
+                    continue
+                user = spoken
+                print(f"you (spoken)> {user}")
             if user == ":reset":
                 history = [{"role": "system", "content": SYSTEM_PROMPT}]
                 print("[history cleared]")
@@ -423,9 +647,26 @@ if __name__ == "__main__":
         "--volume", default="1.0",
         help="Initial speech volume. Accepts 0.0-2.0 multiplier or 0-200 percent (default: 1.0).",
     )
+    parser.add_argument(
+        "--no-mic", action="store_true",
+        help="Disable speech input (default: enabled — press Enter or use ':say' to speak).",
+    )
+    parser.add_argument(
+        "--mic-device", default=MIC_DEVICE,
+        help=f"ALSA capture device for the microphone (default: {MIC_DEVICE}).",
+    )
+    parser.add_argument(
+        "--whisper-model", default=WHISPER_MODEL,
+        help=f"Whisper model name for transcription (default: {WHISPER_MODEL}).",
+    )
     args = parser.parse_args()
     try:
         vol = parse_volume(args.volume)
     except ValueError:
         sys.exit(f"Invalid --volume: {args.volume!r}")
-    run_repl(initial_volume=vol)
+    run_repl(
+        initial_volume=vol,
+        mic_enabled=not args.no_mic,
+        mic_device=args.mic_device,
+        whisper_model=args.whisper_model,
+    )
