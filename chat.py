@@ -36,6 +36,9 @@ MIC_DEVICE = "plughw:0,0"     # C920 webcam mic (card 0)
 WHISPER_MODEL = "tiny"        # tiny ~73MB, fast on Jetson CPU
 WAKE_MODEL_NAME = "hey_jarvis_v0.1"  # built-in openwakeword model
 WAKE_THRESHOLD = 0.5          # 0..1; raise for fewer false positives
+VIDEO_DEVICE = "/dev/video0"  # C920 capture node (video1 is the metadata pair)
+# Anchor the YOLO weights beside chat.py so auto-download is cwd-independent.
+YOLO_MODEL = str(Path(__file__).resolve().parent / "yolov8n.pt")  # nano: ~6MB
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant. Your replies will be spoken aloud, "
     "so keep them concise and conversational. Avoid markdown, code fences, "
@@ -44,11 +47,51 @@ SYSTEM_PROMPT = (
 
 PIPER_BIN = shutil.which("piper") or str(Path.home() / ".local/bin/piper")
 SENTENCE_END = re.compile(r"([.!?]+[\")\]]?\s+|\n{2,})")
+VISION_TRIGGER = re.compile(
+    r"^\s*(what (can|do) you see|describe what you see|"
+    r"(can you )?(tell me )?(what'?s in front of you)|"
+    r"look (around|at this)|tell me what you see)[?.!\s]*$",
+    re.IGNORECASE,
+)
 
 
 def voice_sample_rate(voice_path: Path) -> int:
     config = json.loads((voice_path.with_suffix(".onnx.json")).read_text())
     return int(config["audio"]["sample_rate"])
+
+
+def describe_detections(labels: list[str]) -> str:
+    """Format YOLO class labels as a spoken sentence."""
+    if not labels:
+        return "I don't see anything I recognise."
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for label in labels:
+        if label not in counts:
+            order.append(label)
+        counts[label] = counts.get(label, 0) + 1
+    number_words = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+                    7: "seven", 8: "eight", 9: "nine"}
+    # COCO classes that don't take a vanilla "+s" plural.
+    irregular_plurals = {
+        "person": "people", "mouse": "mice", "sheep": "sheep",
+        "scissors": "scissors", "skis": "skis",
+    }
+    parts: list[str] = []
+    for label in order:
+        n = counts[label]
+        if n == 1:
+            article = "an" if label[:1].lower() in "aeiou" else "a"
+            parts.append(f"{article} {label}")
+        else:
+            word = number_words.get(n, str(n))
+            plural = irregular_plurals.get(label, f"{label}s")
+            parts.append(f"{word} {plural}")
+    if len(parts) == 1:
+        return f"I can see {parts[0]}."
+    if len(parts) == 2:
+        return f"I can see {parts[0]} and {parts[1]}."
+    return f"I can see {', '.join(parts[:-1])}, and {parts[-1]}."
 
 
 def clean_for_speech(text: str) -> str:
@@ -570,6 +613,87 @@ class WakeListener:
                     self._proc.kill()
 
 
+class Vision:
+    """Grab a frame from the C920 and run YOLO object detection.
+
+    Frame capture is a one-shot ffmpeg subprocess (matches the project's
+    audio-I/O pattern). The YOLO model is lazy-loaded on first call so
+    sessions that never trigger vision pay nothing for ultralytics import
+    and the model download.
+    """
+
+    CAPTURE_TIMEOUT_S = 8
+    FRAME_PATH = Path("/tmp/ollama_voice_frame.jpg")
+
+    def __init__(self, video_device: str = VIDEO_DEVICE, model_name: str = YOLO_MODEL):
+        self.video_device = video_device
+        self.model_name = model_name
+        self._model = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self, status: "StatusBar | None" = None):
+        if self._model is not None:
+            return self._model
+        with self._lock:
+            if self._model is None:
+                if status:
+                    status.set_activity(f"loading {self.model_name}")
+                else:
+                    print(f"[loading {self.model_name}...]", flush=True)
+                from ultralytics import YOLO  # lazy: heavy import + torch
+                self._model = YOLO(self.model_name)
+                if status:
+                    status.set_activity(None)
+        return self._model
+
+    def capture_frame(self, status: "StatusBar | None" = None) -> Path | None:
+        if status:
+            status.set_activity("capturing frame")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "v4l2",
+                    "-input_format", "mjpeg",
+                    "-video_size", "1280x720",
+                    "-i", self.video_device,
+                    "-frames:v", "1",
+                    str(self.FRAME_PATH),
+                ],
+                capture_output=True,
+                timeout=self.CAPTURE_TIMEOUT_S,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"\n[camera error: {e}]", file=sys.stderr)
+            return None
+        finally:
+            if status:
+                status.set_activity(None)
+        if result.returncode != 0:
+            tail = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1:]
+            print(f"\n[camera error] {' '.join(tail)}", file=sys.stderr)
+            return None
+        return self.FRAME_PATH if self.FRAME_PATH.exists() else None
+
+    def detect(self, image_path: Path, status: "StatusBar | None" = None) -> list[str]:
+        model = self._ensure_model(status)
+        if status:
+            status.set_activity("detecting")
+        try:
+            results = model(str(image_path), verbose=False)
+        finally:
+            if status:
+                status.set_activity(None)
+        if not results:
+            return []
+        result = results[0]
+        names = result.names
+        cls_tensor = getattr(result.boxes, "cls", None)
+        if cls_tensor is None:
+            return []
+        return [names[int(c)] for c in cls_tensor.tolist()]
+
+
 class StatusBar:
     """Pinned bottom-row status with a braille throbber.
 
@@ -751,6 +875,9 @@ def run_repl(
     wake_enabled: bool = False,
     wake_model: str = WAKE_MODEL_NAME,
     wake_threshold: float = WAKE_THRESHOLD,
+    vision_enabled: bool = True,
+    video_device: str = VIDEO_DEVICE,
+    yolo_model: str = YOLO_MODEL,
 ) -> None:
     if not VOICE.exists():
         sys.exit(f"Voice model not found: {VOICE}")
@@ -762,6 +889,7 @@ def run_repl(
         mic_enabled = True
     listener = Listener(mic_device=mic_device, model_name=whisper_model) if mic_enabled else None
     wake: WakeListener | None = None
+    vision = Vision(video_device=video_device, model_name=yolo_model) if vision_enabled else None
     history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def handle_sigint(signum, frame):
@@ -835,9 +963,10 @@ def run_repl(
 
     mic_hint = " '<Enter>' speak," if (mic_enabled and not wake_enabled) else ""
     wake_hint = f" (say '{wake_model.split('_')[0]} {wake_model.split('_')[1]}')" if wake_enabled else ""
+    vision_hint = " ':see' look," if vision is not None else ""
     print(
         f"Voice chat with {MODEL}. Volume {int(speaker.volume * 100)}%."
-        f"{wake_hint} Commands:{mic_hint} ':q' quit, ':reset' clear history, ':vol N' volume (0-200)."
+        f"{wake_hint} Commands:{mic_hint}{vision_hint} ':q' quit, ':reset' clear history, ':vol N' volume (0-200)."
     )
     status.start()
     if wake_enabled:
@@ -894,6 +1023,28 @@ def run_repl(
                     speaker.set_volume(new_vol)
                     note = " (may clip)" if new_vol > 1.0 else ""
                     print(f"[volume set to {int(new_vol * 100)}%{note}]")
+                continue
+
+            if vision is not None and (user == ":see" or VISION_TRIGGER.match(user)):
+                history.append({"role": "user", "content": user})
+                print("bot> ", end="", flush=True)
+                status.thinking(True)
+                try:
+                    frame = vision.capture_frame(status=status)
+                    if frame is None:
+                        reply = "I couldn't access the camera."
+                    else:
+                        labels = vision.detect(frame, status=status)
+                        reply = describe_detections(labels)
+                except Exception as e:  # noqa: BLE001
+                    reply = "I had trouble looking at the camera."
+                    print(f"\n[vision error] {e}", file=sys.stderr)
+                finally:
+                    status.thinking(False)
+                print(reply)
+                speaker.say(reply)
+                history.append({"role": "assistant", "content": reply})
+                speaker.wait_until_idle()
                 continue
 
             history.append({"role": "user", "content": user})
@@ -984,6 +1135,18 @@ if __name__ == "__main__":
         "--wake-threshold", type=float, default=WAKE_THRESHOLD,
         help=f"Detection score 0..1 (default: {WAKE_THRESHOLD}). Raise for fewer false positives.",
     )
+    parser.add_argument(
+        "--no-vision", action="store_true",
+        help="Disable vision (default: enabled — say 'what can you see?' or use ':see').",
+    )
+    parser.add_argument(
+        "--video-device", default=VIDEO_DEVICE,
+        help=f"V4L2 capture device for the camera (default: {VIDEO_DEVICE}).",
+    )
+    parser.add_argument(
+        "--yolo-model", default=YOLO_MODEL,
+        help=f"Ultralytics YOLO model name or path (default: {YOLO_MODEL}).",
+    )
     args = parser.parse_args()
     try:
         vol = parse_volume(args.volume)
@@ -997,4 +1160,7 @@ if __name__ == "__main__":
         wake_enabled=args.wake,
         wake_model=args.wake_model,
         wake_threshold=args.wake_threshold,
+        vision_enabled=not args.no_vision,
+        video_device=args.video_device,
+        yolo_model=args.yolo_model,
     )
