@@ -32,6 +32,10 @@ These are already set up on this Jetson, but listed for reference:
   `arecord -l`)
 - **openwakeword** with the `hey_jarvis_v0.1` model downloaded — for the
   wake-word feature (only loaded when `--wake` is passed)
+- **ultralytics** (`pip install ultralytics`) and **ffmpeg** — for the
+  vision feature. The `yolov8n.pt` weights auto-download next to `chat.py`
+  on first use.
+- **C920 camera** at `/dev/video0` (the same device exposes the mic)
 - Python 3.10 with `requests`, `numpy`
 
 > The Jetson's system Python has a numpy/pandas ABI mismatch that breaks
@@ -62,6 +66,8 @@ Other CLI flags:
 ./chat.py --wake                         # enable wake-word ('hey jarvis')
 ./chat.py --wake --wake-threshold 0.7    # require a stronger detection
 ./chat.py --wake --wake-model alexa_v0.1 # try a different built-in word
+./chat.py --no-vision                    # disable the camera/YOLO feature
+./chat.py --yolo-model yolov8s.pt        # bigger YOLO model (slower, more accurate)
 ```
 
 ## REPL commands
@@ -70,6 +76,7 @@ Other CLI flags:
 | ------------- | ----------------------------------------------------- |
 | `<Enter>`     | (empty input) Push-to-talk: record from mic and send  |
 | `:say`        | Same as pressing Enter on an empty prompt             |
+| `:see`        | Take a webcam frame and speak detected objects        |
 | `:q`          | Quit                                                  |
 | `:reset`      | Clear conversation history                            |
 | `:vol`        | Show current volume                                   |
@@ -88,6 +95,24 @@ sent to Ollama like a typed prompt.
 The Whisper model loads lazily on the first speech attempt (~73 MB for
 `tiny`, a few seconds on Jetson CPU), so users in text-only mode pay
 nothing.
+
+### Vision
+
+Ask "what can you see?" (typed, push-to-talk, or via the wake word) and the
+assistant grabs a frame from the C920, runs YOLOv8-nano object detection,
+and speaks the result — e.g. *"I can see a laptop and a person."* The
+trigger also matches "what do you see", "describe what you see", "look
+around", "tell me what you see", and "what's in front of you", or use
+`:see` for a deterministic command.
+
+The YOLO model loads lazily on the first vision request (~1–2 s on Jetson
+CPU; weights are ~6 MB, auto-downloaded once into the repo). Detection is
+CPU-only — the Jetson's CUDA driver is too old for the bundled torch build,
+but the nano model is fast enough that this is fine.
+
+Disable with `--no-vision`. Override the model with `--yolo-model
+yolov8s.pt` (or any ultralytics model name) for better accuracy at the
+cost of speed.
 
 ### Wake word
 
